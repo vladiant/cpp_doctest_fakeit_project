@@ -3230,7 +3230,7 @@ void String::copy(const String& other) {
 }
 
 String::String() {
-    buf[0] = '\0';
+    memset(buf, '\0', len);
     setLast();
 }
 
@@ -3246,8 +3246,8 @@ String::String(const char* in)
 String::String(const char* in, unsigned in_size) {
     using namespace std;
     if(in_size <= last) {
+        memset(buf, '\0', len);
         memcpy(buf, in, in_size);
-        buf[in_size] = '\0';
         setLast(last - in_size);
     } else {
         setOnHeap();
