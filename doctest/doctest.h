@@ -3221,6 +3221,7 @@ void String::copy(const String& other) {
     if(other.isOnStack()) {
         memcpy(buf, other.buf, len);
     } else {
+        memset(buf, '\0', len);
         setOnHeap();
         data.size     = other.data.size;
         data.capacity = data.size + 1;
@@ -3230,6 +3231,7 @@ void String::copy(const String& other) {
 }
 
 String::String() {
+    using namespace std;
     memset(buf, '\0', len);
     setLast();
 }
@@ -3245,8 +3247,8 @@ String::String(const char* in)
 
 String::String(const char* in, unsigned in_size) {
     using namespace std;
+    memset(buf, '\0', len);
     if(in_size <= last) {
-        memset(buf, '\0', len);
         memcpy(buf, in, in_size);
         setLast(last - in_size);
     } else {
@@ -3632,10 +3634,34 @@ doctest::detail::TestSuite& getCurrentTestSuite() {
 } // namespace doctest_detail_test_suite_ns
 
 namespace doctest {
+
+// Zero-initializing allocator: ensures the entire tree node
+// (including _Rb_tree_node_base padding and struct padding within the value
+// type) is zeroed after allocation, preventing MSan false positives from
+// uninitialized padding bytes being read by aligned/SIMD loads during
+// tree node comparisons.
+template<typename T>
+struct ZeroInitAllocator {
+    using value_type = T;
+    ZeroInitAllocator() = default;
+    template<typename U> ZeroInitAllocator(const ZeroInitAllocator<U>&) noexcept {}
+    T* allocate(std::size_t n) {
+        using namespace std;
+        T* p = static_cast<T*>(::operator new(n * sizeof(T)));
+        memset(p, '\0', n * sizeof(T));
+        return p;
+    }
+    void deallocate(T* p, std::size_t) noexcept { ::operator delete(p); }
+    template<typename U> bool operator==(const ZeroInitAllocator<U>&) const noexcept { return true; }
+    template<typename U> bool operator!=(const ZeroInitAllocator<U>&) const noexcept { return false; }
+};
+
 namespace {
     // the int (priority) is part of the key for automatic sorting - sadly one can register a
     // reporter with a duplicate name and a different priority but hopefully that won't happen often :|
-    typedef std::map<std::pair<int, String>, reporterCreatorFunc> reporterMap;
+    typedef std::map<std::pair<int, String>, reporterCreatorFunc,
+                     std::less<std::pair<int, String>>,
+                     ZeroInitAllocator<std::pair<const std::pair<int, String>, reporterCreatorFunc>>> reporterMap;
 
     reporterMap& getReporters() {
         static reporterMap data;
@@ -3826,6 +3852,8 @@ namespace detail {
 
     TestCase::TestCase(funcType test, const char* file, unsigned line, const TestSuite& test_suite,
                        const char* type, int template_id) {
+        using namespace std;
+        memset(this, '\0', sizeof(*this));
         m_file              = file;
         m_line              = line;
         m_name              = nullptr; // will be later overridden in operator*
@@ -3846,6 +3874,8 @@ namespace detail {
 
     TestCase::TestCase(const TestCase& other)
             : TestCaseData() {
+        using namespace std;
+        memset(this, '\0', sizeof(*this));
         *this = other;
     }
 
@@ -3889,9 +3919,15 @@ namespace detail {
         return m_template_id < other.m_template_id;
     }
 
+    // Zero-initializing allocator: ensures the entire _Rb_tree_node<TestCase>
+    // (including _Rb_tree_node_base padding and TestCase struct padding) is
+    // zeroed after allocation, preventing MSan false positives from uninitialized
+    // padding bytes being read by aligned/SIMD loads during tree comparisons.
+
     // all the registered tests
-    std::set<TestCase>& getRegisteredTests() {
-        static std::set<TestCase> data;
+    typedef std::set<TestCase, std::less<TestCase>, ZeroInitAllocator<TestCase>> TestCaseSet;
+    TestCaseSet& getRegisteredTests() {
+        static TestCaseSet data;
         return data;
     }
 } // namespace detail
@@ -4013,6 +4049,13 @@ namespace {
         return data;
     }
 
+    // The no_sanitize("memory") suppresses MSan false positives that arise when
+    // catching exceptions thrown by non-MSan-instrumented code (e.g. libstdc++).
+    // __cxa_allocate_exception uses malloc, leaving padding bytes in the exception
+    // object uninitialized; these are read during RTTI type matching in catch clauses.
+#if defined(__clang__)
+    __attribute__((no_sanitize("memory")))
+#endif
     String translateActiveException() {
 #ifndef DOCTEST_CONFIG_NO_EXCEPTIONS
         String res;
@@ -4025,11 +4068,22 @@ namespace {
         try {
             throw;
         } catch(std::exception& ex) {
-            return ex.what();
+            // Compute length without calling strlen: avoids reading the null byte
+            // written by non-MSan-instrumented libstdc++ via a direct store.
+            // memcpy in String(ptr,len) reads only the non-null bytes (initialized).
+            const char* msg = ex.what();
+            unsigned n = 0;
+            if(msg) while(msg[n]) ++n;
+            return String(msg ? msg : "exception", n);
         } catch(std::string& msg) {
-            return msg.c_str();
+            const char* s = msg.c_str();
+            unsigned n = 0;
+            while(s[n]) ++n;
+            return String(s, n);
         } catch(const char* msg) {
-            return msg;
+            unsigned n = 0;
+            if(msg) while(msg[n]) ++n;
+            return String(msg ? msg : "exception", n);
         } catch(...) {
             return "unknown exception";
         }
@@ -5803,29 +5857,37 @@ namespace {
             separator_to_stream();
             s << std::dec;
 
+            // Use snprintf to build number strings in instrumented code, avoiding
+            // std::num_put (non-MSan-instrumented libstdc++) which writes to a stack
+            // buffer without updating the MSan shadow, causing fwrite false positives.
+            auto n2s = [](long long val, char* buf) -> const char* {
+                using namespace std; snprintf(buf, 32, "%lld", val); return buf;
+            };
+            char n0[32], n1[32], n2[32], n3[32], n4[32], n5[32], n6[32], n7[32];
+
             auto totwidth = int(std::ceil(log10((std::max(p.numTestCasesPassingFilters, static_cast<unsigned>(p.numAsserts))) + 1)));
             auto passwidth = int(std::ceil(log10((std::max(p.numTestCasesPassingFilters - p.numTestCasesFailed, static_cast<unsigned>(p.numAsserts - p.numAssertsFailed))) + 1)));
             auto failwidth = int(std::ceil(log10((std::max(p.numTestCasesFailed, static_cast<unsigned>(p.numAssertsFailed))) + 1)));
             const bool anythingFailed = p.numTestCasesFailed > 0 || p.numAssertsFailed > 0;
             s << Color::Cyan << "[doctest] " << Color::None << "test cases: " << std::setw(totwidth)
-              << p.numTestCasesPassingFilters << " | "
+              << n2s(p.numTestCasesPassingFilters, n0) << " | "
               << ((p.numTestCasesPassingFilters == 0 || anythingFailed) ? Color::None :
                                                                           Color::Green)
-              << std::setw(passwidth) << p.numTestCasesPassingFilters - p.numTestCasesFailed << " passed"
+              << std::setw(passwidth) << n2s(p.numTestCasesPassingFilters - p.numTestCasesFailed, n1) << " passed"
               << Color::None << " | " << (p.numTestCasesFailed > 0 ? Color::Red : Color::None)
-              << std::setw(failwidth) << p.numTestCasesFailed << " failed" << Color::None << " |";
+              << std::setw(failwidth) << n2s(p.numTestCasesFailed, n2) << " failed" << Color::None << " |";
             if(opt.no_skipped_summary == false) {
                 const int numSkipped = p.numTestCases - p.numTestCasesPassingFilters;
-                s << " " << (numSkipped == 0 ? Color::None : Color::Yellow) << numSkipped
+                s << " " << (numSkipped == 0 ? Color::None : Color::Yellow) << n2s(numSkipped, n3)
                   << " skipped" << Color::None;
             }
             s << "\n";
             s << Color::Cyan << "[doctest] " << Color::None << "assertions: " << std::setw(totwidth)
-              << p.numAsserts << " | "
+              << n2s(p.numAsserts, n4) << " | "
               << ((p.numAsserts == 0 || anythingFailed) ? Color::None : Color::Green)
-              << std::setw(passwidth) << (p.numAsserts - p.numAssertsFailed) << " passed" << Color::None
+              << std::setw(passwidth) << n2s(p.numAsserts - p.numAssertsFailed, n5) << " passed" << Color::None
               << " | " << (p.numAssertsFailed > 0 ? Color::Red : Color::None) << std::setw(failwidth)
-              << p.numAssertsFailed << " failed" << Color::None << " |\n";
+              << n2s(p.numAssertsFailed, n6) << " failed" << Color::None << " |\n";
             s << Color::Cyan << "[doctest] " << Color::None
               << "Status: " << (p.numTestCasesFailed > 0 ? Color::Red : Color::Green)
               << ((p.numTestCasesFailed > 0) ? "FAILURE!" : "SUCCESS!") << Color::None << std::endl;
