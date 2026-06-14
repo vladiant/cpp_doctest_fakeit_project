@@ -1,0 +1,4 @@
+# Suppress libstdc++ false positives from non-MSan-instrumented code
+fun:std::ctype<char>::_M_widen_init*
+fun:std::num_put*_M_insert_int*
+fun:std::num_put*_M_insert_float*
