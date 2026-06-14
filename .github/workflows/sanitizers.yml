@@ -64,10 +64,15 @@ jobs:
       shell: bash
       run: ./SampleLibApp
 
-#    - name: Test
-#      working-directory: ${{github.workspace}}/build-clang-msan
-#      shell: bash
-#      run: ctest -VV --progress
+    - name: Test
+      working-directory: ${{github.workspace}}/build-clang-msan
+      shell: bash
+      env:
+        # intercept_memcmp=0: suppresses false positive from std::ctype<char>::_M_widen_init()
+        # in non-MSan-instrumented libstdc++ (GCC 14) which reads an internal lookup table
+        # written by its own non-instrumented code, triggering the memcmp interceptor.
+        MSAN_OPTIONS: "intercept_memcmp=0"
+      run: ctest -VV --progress
 
   build-thread-sanitizer:
     name: Thread Sanitizer
