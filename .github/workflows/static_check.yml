@@ -51,7 +51,7 @@ jobs:
       run: |
           cppcheck --project=${{github.workspace}}/compile_commands.json \
                    --std=c++17 \
-                   --output-file=${{github.workspace}}/cppcheck-report.txt .
+                   --output-file=${{github.workspace}}/cppcheck-report.txt
 
     - name: Upload CppCheck Result
       uses: actions/upload-artifact@v7
